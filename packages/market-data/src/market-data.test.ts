@@ -5,9 +5,9 @@ import {
   Ladder,
   BinanceDepthBook,
   BinanceDepthDiff,
-  PolymarketBookState,
-  PolymarketBookMessage,
-  PolymarketPriceChangeMessage,
+  PolymarketUsBook,
+  MarketDataMessage,
+  parseTransactTime,
   evaluateFeedHealth,
   assembleUnifiedState,
   backoffDelay,
@@ -73,68 +73,64 @@ test('BinanceDepthBook flags a gap on a non-contiguous update and clears book', 
   assert.equal(book.toBTCState(1_700_000_000_300), null); // not tradeable until resync
 });
 
-// ── Polymarket book: snapshot + reconciliation desync ───────────────────────
+// ── Polymarket US book: full-snapshot-per-message ───────────────────────────
 const MKT = 'btc-1700' as MarketId;
 const TOK = 'tok-yes' as TokenId;
 
-function snapshot(bids: [string, string][], asks: [string, string][]): PolymarketBookMessage {
-  return PolymarketBookMessage.parse({
-    event_type: 'book',
-    asset_id: TOK,
-    market: MKT,
-    bids: bids.map(([price, size]) => ({ price, size })),
-    asks: asks.map(([price, size]) => ({ price, size })),
-    hash: '0xabc',
-    timestamp: '1700000000000',
+function marketData(
+  bids: [string, string][],
+  offers: [string, string][],
+  opts: { state?: string; transactTime?: string } = {},
+): MarketDataMessage {
+  return MarketDataMessage.parse({
+    requestId: 'r1',
+    subscriptionType: 'SUBSCRIPTION_TYPE_MARKET_DATA',
+    marketData: {
+      marketSlug: 'btc-1700',
+      bids: bids.map(([v, qty]) => ({ px: { value: v, currency: 'USD' }, qty })),
+      offers: offers.map(([v, qty]) => ({ px: { value: v, currency: 'USD' }, qty })),
+      state: opts.state ?? 'open',
+      ...(opts.transactTime !== undefined ? { transactTime: opts.transactTime } : {}),
+    },
   });
 }
 
-function priceChange(
-  changes: { price: string; size: string; side: 'BUY' | 'SELL'; best_bid?: string; best_ask?: string }[],
-): PolymarketPriceChangeMessage {
-  return PolymarketPriceChangeMessage.parse({
-    event_type: 'price_change',
-    market: MKT,
-    timestamp: '1700000000500',
-    price_changes: changes.map((c) => ({ asset_id: TOK, hash: '0xdef', ...c })),
-  });
-}
-
-test('PolymarketBookState drops deltas until a snapshot arrives', () => {
-  const s = new PolymarketBookState({ market_id: MKT, token_id: TOK, side: 'YES' });
-  assert.equal(s.applyPriceChange(priceChange([{ price: '0.39', size: '5', side: 'BUY' }])).kind, 'dropped_unsynced');
-  assert.equal(s.synced, false);
+test('PolymarketUsBook has no data until a MarketData frame arrives', () => {
+  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+  assert.equal(s.hasData, false);
 });
 
-test('PolymarketBookState applies a reconciling delta', () => {
-  const s = new PolymarketBookState({ market_id: MKT, token_id: TOK, side: 'YES' });
-  s.applySnapshot(snapshot([['0.39', '10']], [['0.41', '8']]));
-  // Improve the bid to 0.40; message says resulting best_bid=0.40, best_ask=0.41.
-  const res = s.applyPriceChange(
-    priceChange([{ price: '0.40', size: '6', side: 'BUY', best_bid: '0.40', best_ask: '0.41' }]),
-  );
-  assert.equal(res.kind, 'applied');
-  const book = s.toBook(1_700_000_000_600);
-  assert.equal(book.bids[0]!.price, 0.4);
-  assert.equal(book.book_hash, '0xdef');
+test('PolymarketUsBook replaces the whole book on each snapshot', () => {
+  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+  s.apply(marketData([['0.39', '10']], [['0.41', '8']], { transactTime: '1700000000000' }), 1_700_000_000_050);
+  let book = s.toBook(1_700_000_000_060);
+  assert.equal(book.bids[0]!.price, 0.39);
+  assert.equal(book.asks[0]!.price, 0.41); // `offers` map to asks
+  assert.equal(book.timestamps.exchange_timestamp, 1_700_000_000_000);
   assert.equal(book.sequence, null);
+  assert.equal(book.book_hash, null);
   assert.equal(book.gap_detected, false);
+
+  // A new snapshot fully replaces prior state (not merged).
+  s.apply(marketData([['0.42', '3']], [['0.44', '2']], { state: 'open', transactTime: '1700000001000' }), 1_700_000_001_050);
+  book = s.toBook(1_700_000_001_060);
+  assert.deepEqual(book.bids, [{ price: 0.42, size: 3 }]);
+  assert.deepEqual(book.asks, [{ price: 0.44, size: 2 }]);
+  assert.equal(s.state, 'open');
 });
 
-test('PolymarketBookState desyncs when top-of-book fails reconciliation', () => {
-  const s = new PolymarketBookState({ market_id: MKT, token_id: TOK, side: 'YES' });
-  s.applySnapshot(snapshot([['0.39', '10']], [['0.41', '8']]));
-  // Apply a bid at 0.40 but claim best_bid should be 0.45 → local (0.40) != 0.45.
-  const res = s.applyPriceChange(
-    priceChange([{ price: '0.40', size: '6', side: 'BUY', best_bid: '0.45', best_ask: '0.41' }]),
-  );
-  assert.equal(res.kind, 'desync');
-  assert.equal(s.synced, false);
-  assert.equal(s.gapDetected, true);
-  // A fresh snapshot resyncs.
-  s.applySnapshot(snapshot([['0.42', '3']], [['0.44', '2']]));
-  assert.equal(s.synced, true);
-  assert.equal(s.gapDetected, false);
+test('PolymarketUsBook falls back to receive time when transactTime is absent', () => {
+  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+  s.apply(marketData([['0.5', '1']], [['0.51', '1']]), 1_700_000_002_000);
+  assert.equal(s.toBook(1_700_000_002_010).timestamps.exchange_timestamp, 1_700_000_002_000);
+});
+
+test('parseTransactTime handles epoch-ms strings, ISO, and junk', () => {
+  assert.equal(parseTransactTime('1700000000000', 1), 1_700_000_000_000);
+  assert.equal(parseTransactTime('2023-11-14T22:13:20.000Z', 1), Date.parse('2023-11-14T22:13:20.000Z'));
+  assert.equal(parseTransactTime('', 42), 42);
+  assert.equal(parseTransactTime(undefined, 42), 42);
+  assert.equal(parseTransactTime('not-a-date', 42), 42);
 });
 
 // ── Feed health ─────────────────────────────────────────────────────────────

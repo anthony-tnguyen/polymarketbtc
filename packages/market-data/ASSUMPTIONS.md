@@ -4,8 +4,10 @@ Per `AGENTS.md` §9, every subsystem documents its assumptions. These are the
 ones that bound the fidelity of everything downstream (replay, labels, backtest),
 so they are written down explicitly and revisited against live captures.
 
-Sources: Polymarket real-time-data / CLOB websocket docs and the
-`Polymarket/agent-skills` reference; Binance spot market-streams docs.
+Sources: Polymarket US SDK (`Polymarket/polymarket-us-typescript`,
+`src/websocket/types.ts`, `src/types/common.ts`) and docs.polymarket.us; Binance
+spot market-streams docs. (International-venue sources are cited in the historical
+note at the end.)
 
 ---
 
@@ -32,78 +34,67 @@ anchored to a REST order-book snapshot, because it gives us *real* sequencing.
 diff stream. If a venue change breaks this, gap detection over-fires (safe:
 triggers a re-snapshot) rather than silently corrupting the book.
 
-## Polymarket (the market we trade)
+## Polymarket US (the venue we trade) — confirmed 2026-10-01
 
-Market channel (`wss://ws-subscriptions-clob.polymarket.com/ws/market`), no auth.
+**Target venue is Polymarket US** (polymarket.us), the CFTC-regulated DCM/DCO
+operated by QCX LLC — NOT the international on-chain CLOB (polymarket.com). They
+are separate venues with separate stacks; the choice is recorded here because it
+determines the entire ingestion layer. (US persons are close-only on the
+international venue, so it is not a trading target for us.)
 
-Message types observed: `book`, `price_change`, `last_trade_price`,
-`tick_size_change`, `best_bid_ask`, `new_market`, `market_resolved`.
+Market data comes from the **Markets WebSocket**
+(`wss://api.polymarket.us/v1/ws/markets`). Subscriptions:
+`SUBSCRIPTION_TYPE_MARKET_DATA` (full book + stats), `..._MARKET_DATA_LITE`
+(best bid/ask only), `..._TRADE`. Shapes mirror the official SDK
+(`Polymarket/polymarket-us-typescript`, `src/websocket/types.ts`).
 
-- **No sequence number exists on this channel.** There is a `hash` field on
-  `book` and `price_change`. The algorithm is published in Polymarket's own TS
-  client but is **not practically usable for live integrity verification** — see
-  "Hash investigation" below. We record the hash for audit and do **not** gate on
-  recomputing it.
-- `book` is a **full snapshot** (bids/asks ladders). It arrives on subscribe and
-  after trades. It is our source of truth / resync point.
-- `price_change` is a **delta**; `size == "0"` removes that price level. It also
-  carries `best_bid` / `best_ask` of the resulting book.
-- `timestamp` is a **string of epoch milliseconds** → `exchange_timestamp`.
+- **Full snapshot per message.** A `MarketData` frame carries the COMPLETE book
+  every time (`bids` + `offers`, each `{ px: Amount, qty }`). There are **no
+  deltas, no `hash`, and no sequence number** on the WS path. Book maintenance is
+  therefore "replace the ladder each message" (`PolymarketUsBook.apply`); there
+  is no delta-desync concept, so the hash saga and the old reconciliation
+  workarounds (prior P1–P4) are **retired for this venue**.
+- **Sequence numbers live on the FIX gateway**, not the WS feed. If we later need
+  sequenced, gap-recoverable market data (institutional), that is the FIX
+  market-data gateway (session-scoped seq nums, `ResetSeqNumFlag`), a separate
+  adapter. For the recorder we use the WS feed.
+- `Amount` is `{ value: string, currency: "USD" }`; `offers` are the ask side.
+- Integrity reduces to **staleness + disconnect** detection (feed-health layer),
+  since every message is a fresh full book.
 
-**ASSUMPTION P1 (integrity check).** Because there is no sequence number and the
-hash is opaque, we detect desync by reconciliation: after applying a
-`price_change` to the local ladder, our recomputed best bid/ask must equal the
-message's `best_bid`/`best_ask`. On mismatch we mark the book out-of-sync
-(`gap_detected = true`), discard local ladder state, and wait for the next
-`book` snapshot to resync. This is strictly conservative — a false desync costs
-us one snapshot wait, never a corrupted book.
+**ASSUMPTION US-TS (timestamp).** `transactTime` is a string; a purely-numeric
+value is treated as epoch milliseconds, otherwise as ISO-8601
+(`parseTransactTime`). When absent, the local receive time is used as the
+exchange-time fallback (the two timestamps stay distinct). **Confirm the real
+unit against a live frame before trusting recorded times.**
 
-**ASSUMPTION P2.** A `book` snapshot fully replaces local state (we do not try
-to merge it). `market_resolved` ends the market; no further trading.
+**ASSUMPTION US-PX (price units).** `px.value` is parsed as dollars in `[0, 1]`
+(e.g. "0.37" = 37¢). If the DCM quotes in cents (0–100) instead, divide by 100.
+**Confirm against a live frame.**
 
-**ASSUMPTION P3.** `best_bid`/`best_ask` in a `price_change` are present and
-authoritative when the field is non-null. When null (thin/empty side), we skip
-the reconciliation check for that side rather than forcing a desync.
+### Open questions (need docs.polymarket.us access — egress-blocked here — or a
+live capture):
 
-**ASSUMPTION P4 (deep-ladder mitigation — REQUIRED before trusting data).** P1's
-best-bid/ask reconciliation catches top-of-book drift but is blind to a dropped
-delta deep in the ladder that does not move the touch. Our features read OBI/OFI
-at 5–10 levels, so deep-ladder corruption matters. Because the venue hash cannot
-be verified (below), the socket adapter / recorder loop MUST force a periodic
-full resubscribe → fresh `book` snapshot on a bounded cadence (`maxSyncAgeMs`,
-and immediately on any desync) so deep-ladder drift cannot accumulate unbounded
-between the `book` snapshots the venue sends on its own. This belongs to the
-(deferred) adapter layer; `PolymarketBookState.applySnapshot` is already the
-idempotent resync primitive it will call.
+1. **Binary market identity.** The WS identifies a contract by `marketSlug` and
+   exposes one `bids`/`offers` book. How are YES vs NO represented — two slugs,
+   or one book priced for YES with NO as the complement? This decides whether
+   `MarketDefinition.token_ids {YES, NO}` is the right contract shape or should
+   become slug-based. Deferred deliberately; the book core takes identity as a
+   parameter so it is unaffected either way.
+2. **transactTime unit** (US-TS) and **price units** (US-PX) above.
+3. Whether `MarketData` is truly snapshot-only or whether a separate incremental
+   update type exists that the SDK does not surface.
 
-## Hash investigation (2026-10-01)
+### Historical note — international hash investigation
 
-Question chased: can we reproduce Polymarket's order-book `hash` client-side and
-use it as an integrity check? **Conclusion: no — treat the hash as
-non-authoritative.** Evidence:
-
-- The algorithm is published: `hash = SHA1_hex(JSON.stringify(orderbook))` with
-  the `hash` field set to `""` before serialization, in
-  `Polymarket/clob-client` `src/utilities.ts` (`generateOrderBookSummaryHash`).
-- But the serialized `OrderBookSummary` (`src/types.ts`) is
-  `{ market, asset_id, timestamp, bids, asks, min_order_size, tick_size,
-  neg_risk, last_trade_price, hash }` — `hash` is **last**, and four fields
-  (`min_order_size`, `tick_size`, `neg_risk`, `last_trade_price`) are included.
-  `JSON.stringify` emits in declaration order, so any other field order fails.
-- The WS market-channel `book`/`price_change` frames do **not** carry those four
-  fields in the same shape, so the exact hashed object cannot be losslessly
-  reconstructed from a websocket frame.
-- Independent implementers report the computation matches the TS *test vectors*
-  but **not real backend messages**, with no documented root cause
-  (py-clob-client issue #209 — now **archived/read-only** as of 2026-05-25;
-  rs-clob-client issue #225 — open, unanswered).
-
-Decision: keep recording `book_hash` for audit; integrity stays on P1 + P4. If
-Polymarket later documents a byte-exact, WS-reconstructable hash (or exposes a
-sequence number), revisit and add recompute-verify as a cheap extra gate.
-
-Sources: `Polymarket/clob-client` src/utilities.ts & src/types.ts;
-py-clob-client#209; rs-clob-client#225; Polymarket/agent-skills websocket.md.
+An earlier pass targeted the international CLOB and chased whether its market-
+channel `hash` could verify book integrity. Conclusion was no: the algorithm
+(`SHA1_hex(JSON.stringify(orderbook))`, hash field blanked) is published in
+`Polymarket/clob-client`, but the exact `OrderBookSummary` field order/extra
+fields can't be reconstructed from a WS frame, and independent implementers
+couldn't match the server on live data (py-clob-client#209, archived; rs-clob-
+client#225, open). That venue is not our target, so the finding is retained only
+as context for why we do not pursue hash-based integrity.
 
 ## Recording
 
