@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.pnp.*
+.yarn/*
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+coverage/
+
+# Env / secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+secrets.json
+aws-exports.js
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# CDK
+infra/cdk/cdk.out/
+cdk.context.json
+
+# Local data / replay scratch
+*.local
+data/raw/
+data/replay-cache/
