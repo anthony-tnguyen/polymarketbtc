@@ -11,8 +11,10 @@ Phase 1 Recorder building blocks. Transport-injected so the venue protocol logic
 - **polymarket** — `PolymarketUsBook`: full-snapshot-per-message book core (US Markets WebSocket sends the complete book every frame; no deltas/hash/sequence) -> `PolymarketBook`. `parseTransactTime` + `MarketData`/`MarketDataLite`/`Trade` zod schemas.
 - **feed-health** — `evaluateFeedHealth`: pure down/degraded/healthy classification backing the `feed_healthy` gate (I14). For the US WS feed, integrity is staleness + disconnect (no per-message desync).
 - **unified-state** — `assembleUnifiedState`: merges `BTCState` + `PolymarketBook` into `UnifiedMarketState` with a freshness snapshot.
+- **clock-sync** — `estimateOffset` + `ClockSynchronizer`: NTP-style local-vs-server offset, median-robust, feeding `clock` feed-health drift (I5/I6/I14). Pure.
+- **rules** — `validateMarketDefinition` / `markValidated`: the I1 gate deciding `rules_validated`, fail-closed (unknown settlement source => invalid). Venue-independent validator; the venue-specific parser is deferred.
 - **transport** — `Transport`/`TransportFactory` interfaces, `MockTransport(Factory)` for tests, `backoffDelay` reconnect policy.
 
 ## Not yet here (thin adapters, untestable in sandbox)
 
-Real socket adapter (reconnect/backoff lifecycle), the FIX market-data gateway (if sequenced data is later needed), market discovery, rules parser, clock-sync estimator, and the Postgres/S3 sinks. Added and validated against live venues before any recorded data is trusted.
+Real socket adapter (reconnect/backoff lifecycle), the FIX market-data gateway (if sequenced data is later needed), market discovery, the venue-specific rules PARSER (raw US market JSON -> `MarketDefinition`, pending the US discovery schema), the clock-sync sampling I/O, and the Postgres/S3 sinks. Added and validated against live venues before any recorded data is trusted.

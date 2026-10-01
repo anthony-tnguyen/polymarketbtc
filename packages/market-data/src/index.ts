@@ -12,6 +12,8 @@ export * from './ladder.js';
 export * from './transport.js';
 export * from './feed-health.js';
 export * from './unified-state.js';
+export * from './clock-sync.js';
+export * from './rules.js';
 
 export * from './binance/messages.js';
 export * from './binance/book.js';
