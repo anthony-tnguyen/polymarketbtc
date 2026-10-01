@@ -40,9 +40,10 @@ Message types observed: `book`, `price_change`, `last_trade_price`,
 `tick_size_change`, `best_bid_ask`, `new_market`, `market_resolved`.
 
 - **No sequence number exists on this channel.** There is a `hash` field on
-  `book` and `price_change`, but **its computation is unspecified**, so a client
-  cannot recompute-and-verify it. We record the hash for audit but do not rely
-  on recomputing it.
+  `book` and `price_change`. The algorithm is published in Polymarket's own TS
+  client but is **not practically usable for live integrity verification** — see
+  "Hash investigation" below. We record the hash for audit and do **not** gate on
+  recomputing it.
 - `book` is a **full snapshot** (bids/asks ladders). It arrives on subscribe and
   after trades. It is our source of truth / resync point.
 - `price_change` is a **delta**; `size == "0"` removes that price level. It also
@@ -63,6 +64,46 @@ to merge it). `market_resolved` ends the market; no further trading.
 **ASSUMPTION P3.** `best_bid`/`best_ask` in a `price_change` are present and
 authoritative when the field is non-null. When null (thin/empty side), we skip
 the reconciliation check for that side rather than forcing a desync.
+
+**ASSUMPTION P4 (deep-ladder mitigation — REQUIRED before trusting data).** P1's
+best-bid/ask reconciliation catches top-of-book drift but is blind to a dropped
+delta deep in the ladder that does not move the touch. Our features read OBI/OFI
+at 5–10 levels, so deep-ladder corruption matters. Because the venue hash cannot
+be verified (below), the socket adapter / recorder loop MUST force a periodic
+full resubscribe → fresh `book` snapshot on a bounded cadence (`maxSyncAgeMs`,
+and immediately on any desync) so deep-ladder drift cannot accumulate unbounded
+between the `book` snapshots the venue sends on its own. This belongs to the
+(deferred) adapter layer; `PolymarketBookState.applySnapshot` is already the
+idempotent resync primitive it will call.
+
+## Hash investigation (2026-10-01)
+
+Question chased: can we reproduce Polymarket's order-book `hash` client-side and
+use it as an integrity check? **Conclusion: no — treat the hash as
+non-authoritative.** Evidence:
+
+- The algorithm is published: `hash = SHA1_hex(JSON.stringify(orderbook))` with
+  the `hash` field set to `""` before serialization, in
+  `Polymarket/clob-client` `src/utilities.ts` (`generateOrderBookSummaryHash`).
+- But the serialized `OrderBookSummary` (`src/types.ts`) is
+  `{ market, asset_id, timestamp, bids, asks, min_order_size, tick_size,
+  neg_risk, last_trade_price, hash }` — `hash` is **last**, and four fields
+  (`min_order_size`, `tick_size`, `neg_risk`, `last_trade_price`) are included.
+  `JSON.stringify` emits in declaration order, so any other field order fails.
+- The WS market-channel `book`/`price_change` frames do **not** carry those four
+  fields in the same shape, so the exact hashed object cannot be losslessly
+  reconstructed from a websocket frame.
+- Independent implementers report the computation matches the TS *test vectors*
+  but **not real backend messages**, with no documented root cause
+  (py-clob-client issue #209 — now **archived/read-only** as of 2026-05-25;
+  rs-clob-client issue #225 — open, unanswered).
+
+Decision: keep recording `book_hash` for audit; integrity stays on P1 + P4. If
+Polymarket later documents a byte-exact, WS-reconstructable hash (or exposes a
+sequence number), revisit and add recompute-verify as a cheap extra gate.
+
+Sources: `Polymarket/clob-client` src/utilities.ts & src/types.ts;
+py-clob-client#209; rs-clob-client#225; Polymarket/agent-skills websocket.md.
 
 ## Recording
 
