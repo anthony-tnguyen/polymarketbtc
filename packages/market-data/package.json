@@ -1,0 +1,31 @@
+{
+  "name": "@pmbtc/market-data",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Phase 1 Recorder: venue ingestion (Binance/Polymarket), order-book maintenance with gap detection, unified state engine, feed-health monitor. Transport-injected so protocol logic is fully testable.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --experimental-strip-types \"src/**/*.test.ts\"",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@pmbtc/contracts": "*",
+    "@pmbtc/core": "*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "typescript": "^5.6.3"
+  }
+}

@@ -26,10 +26,22 @@ export const PolymarketBook = z.object({
   /** Ascending by price. */
   asks: z.array(BookLevel),
   /**
-   * Venue sequence/version for gap detection. Null when unavailable; a detected
-   * gap marks the book unhealthy until resynced (Invariant I6).
+   * Venue sequence/version for gap detection. The Polymarket market channel has
+   * NO sequence number, so this is always null there; gap detection is done by
+   * best-bid/ask reconciliation instead (see market-data/ASSUMPTIONS.md P1).
+   * Present for venues that do expose sequencing.
    */
   sequence: z.number().int().nonnegative().nullable(),
+  /**
+   * The venue-provided integrity hash of the book (`hash` on Polymarket book/
+   * price_change messages). Recorded for audit; its algorithm is unspecified by
+   * the venue so we do NOT recompute-and-verify it. Null when absent.
+   */
+  book_hash: z.string().nullable(),
+  /**
+   * True when the local book is believed out-of-sync (sequence gap, or a failed
+   * best-bid/ask reconciliation) and must be resynced before it is traded (I6).
+   */
   gap_detected: z.boolean(),
 });
 export type PolymarketBook = z.infer<typeof PolymarketBook>;
