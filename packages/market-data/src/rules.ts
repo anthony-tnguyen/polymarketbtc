@@ -1,22 +1,27 @@
 import type { MarketDefinition } from '@pmbtc/contracts';
+import { SUPPORTED_MARKET_TYPES } from '@pmbtc/contracts';
 
 /**
  * Market-rule validation — the enforcement point for Invariant I1 ("never trade a
  * market whose resolution rules have not been validated"). This is the
  * venue-independent VALIDATOR: given a parsed MarketDefinition, it decides whether
- * the rules are coherent and the market is safe to trade. The venue-specific
- * PARSER (raw venue JSON -> MarketDefinition) is separate and lives with market
- * discovery; it must run this before marking a market tradeable.
+ * the rules are coherent, the market TYPE is supported, and the market is safe to
+ * trade. The venue-specific PARSER (raw venue JSON -> MarketDefinition) is separate
+ * and lives with market discovery; it must run this before marking a market
+ * tradeable.
  *
  * Fail-closed: anything we cannot positively affirm makes the market invalid.
+ * Only `BTC_UP_DOWN_REFERENCE` is supported in the current scope; `FIXED_STRIKE`
+ * and `TOUCH` always fail here (Invariant I1).
  */
 
 export interface RulesValidationOptions {
   /**
-   * Settlement sources we recognize and have validated our model against. I1
-   * requires this: trading a market whose settlement source we don't understand
-   * means our probability model may target the wrong event. If omitted/empty,
-   * NO market validates (we cannot claim validation without a known source).
+   * Reference/settlement sources we recognize and have validated our model
+   * against. I1 requires this: trading a market whose settlement source we don't
+   * understand means our probability model may target the wrong event. If
+   * omitted/empty, NO market validates (we cannot claim validation without a
+   * known source). For the US product this is e.g. `['CF_BRTI']`.
    */
   allowedSettlementSources?: readonly string[];
   /** Minimum sane seconds between open and close (reject degenerate windows). */
@@ -29,20 +34,8 @@ export interface RulesValidationResult {
   notes: string[];
 }
 
-/**
- * Validate a MarketDefinition's resolution rules. Returns valid + the list of
- * failures. Does not mutate; use {@link markValidated} to stamp the decision onto
- * a definition.
- */
-export function validateMarketDefinition(
-  def: MarketDefinition,
-  opts: RulesValidationOptions = {},
-): RulesValidationResult {
-  const notes: string[] = [];
-
-  if (!(def.strike > 0) || !Number.isFinite(def.strike)) {
-    notes.push(`strike must be a positive finite number (got ${def.strike})`);
-  }
+/** Fields common to every market type. */
+function validateCommon(def: MarketDefinition, opts: RulesValidationOptions, notes: string[]): void {
   if (!def.underlying) notes.push('underlying is empty');
 
   if (!(def.close_time > def.open_time)) {
@@ -61,19 +54,61 @@ export function validateMarketDefinition(
   if (!(def.min_order_size > 0)) {
     notes.push(`min_order_size must be > 0 (got ${def.min_order_size})`);
   }
+}
 
-  if (!def.token_ids.YES || !def.token_ids.NO) {
-    notes.push('token_ids must include non-empty YES and NO ids');
-  }
-
-  // I1 core: the settlement source must be one we recognize.
+/** Check a source string against the recognized allowlist (I1 core). */
+function validateSource(source: string, label: string, opts: RulesValidationOptions, notes: string[]): void {
   const allow = opts.allowedSettlementSources;
   if (!allow || allow.length === 0) {
-    notes.push('no settlement-source allowlist configured: cannot affirm rules (fail-closed)');
-  } else if (!def.settlement_source) {
-    notes.push('settlement_source is empty');
-  } else if (!allow.includes(def.settlement_source)) {
-    notes.push(`settlement_source "${def.settlement_source}" is not in the recognized allowlist`);
+    notes.push(`no settlement-source allowlist configured: cannot affirm ${label} (fail-closed)`);
+  } else if (!source) {
+    notes.push(`${label} is empty`);
+  } else if (!allow.includes(source)) {
+    notes.push(`${label} "${source}" is not in the recognized allowlist`);
+  }
+}
+
+/**
+ * Validate a MarketDefinition's resolution rules. Returns valid + the list of
+ * failures. Does not mutate; use {@link markValidated} to stamp the decision onto
+ * a definition.
+ */
+export function validateMarketDefinition(
+  def: MarketDefinition,
+  opts: RulesValidationOptions = {},
+): RulesValidationResult {
+  const notes: string[] = [];
+
+  validateCommon(def, opts, notes);
+
+  // Fail closed on any market type the current production scope does not support.
+  if (!(SUPPORTED_MARKET_TYPES as readonly string[]).includes(def.market_type)) {
+    notes.push(
+      `market_type "${def.market_type}" is not supported in the current scope ` +
+        `(supported: ${SUPPORTED_MARKET_TYPES.join(', ')})`,
+    );
+    return { valid: false, notes };
+  }
+
+  // Type-specific validation. Only BTC_UP_DOWN_REFERENCE reaches here.
+  if (def.market_type === 'BTC_UP_DOWN_REFERENCE') {
+    validateSource(def.reference_source, 'reference_source', opts, notes);
+    validateSource(def.settlement_source, 'settlement_source', opts, notes);
+
+    if (!(def.reference_window.end > def.reference_window.start)) {
+      notes.push('reference_window end must be after start');
+    }
+    if (!(def.settlement_window.end > def.settlement_window.start)) {
+      notes.push('settlement_window end must be after start');
+    }
+    if (def.opening_reference_price !== null && !(def.opening_reference_price > 0)) {
+      notes.push(`opening_reference_price must be positive or null (got ${def.opening_reference_price})`);
+    }
+
+    const directions = def.outcomes.map((o) => o.direction);
+    if (!directions.includes('UP') || !directions.includes('DOWN')) {
+      notes.push('outcomes must include exactly one UP and one DOWN');
+    }
   }
 
   return { valid: notes.length === 0, notes };

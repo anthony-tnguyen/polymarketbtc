@@ -10,6 +10,7 @@
  */
 export * from './ladder.js';
 export * from './transport.js';
+export * from './timestamp.js';
 export * from './feed-health.js';
 export * from './unified-state.js';
 export * from './clock-sync.js';
