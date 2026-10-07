@@ -19,7 +19,12 @@ import {
   ClockSynchronizer,
   validateMarketDefinition,
   markValidated,
+  MockTransportFactory,
+  PolymarketUsCapture,
+  InMemoryRawEventSink,
+  buildPolymarketUsSubscribeFrames,
 } from '@pmbtc/market-data';
+import { ManualClock } from '@pmbtc/core';
 import type { MarketDefinition, ReferencePriceState } from '@pmbtc/contracts';
 
 // ── Ladder ────────────────────────────────────────────────────────────────
@@ -341,6 +346,65 @@ test('computeBasis is signed binance − brti in usd and bps', () => {
 });
 
 // ── Backoff ───────────────────────────────────────────────────────────────
+// ── Live capture (transport/clock-injected, deterministic) ──────────────────
+test('PolymarketUsCapture subscribes on open to all three channels', () => {
+  const frames = buildPolymarketUsSubscribeFrames({ marketSlugs: ['btc-1700'], nextRequestId: () => 'r' });
+  assert.equal(frames.length, 3);
+  const types = frames.map((f) => JSON.parse(f).subscriptionType);
+  assert.deepEqual(types, [
+    'SUBSCRIPTION_TYPE_MARKET_DATA',
+    'SUBSCRIPTION_TYPE_MARKET_DATA_LITE',
+    'SUBSCRIPTION_TYPE_TRADE',
+  ]);
+});
+
+test('PolymarketUsCapture archives raw frames verbatim with both timestamps', () => {
+  const factory = new MockTransportFactory();
+  const sink = new InMemoryRawEventSink();
+  const clock = new ManualClock(1_700_000_005_000);
+  const capture = new PolymarketUsCapture({
+    factory,
+    sink,
+    clock,
+    url: 'wss://api.polymarket.us/v1/ws/markets',
+    options: { marketSlugs: ['btc-1700'], nextRequestId: () => 'r' },
+  });
+  capture.start();
+  const transport = factory.created[0]!;
+  transport.pushOpen();
+  assert.equal(transport.sent.length, 3); // subscribed on open
+
+  const frame = JSON.stringify({
+    requestId: 'x',
+    subscriptionType: 'SUBSCRIPTION_TYPE_MARKET_DATA',
+    marketData: {
+      marketSlug: 'btc-1700',
+      bids: [{ px: { value: '0.4', currency: 'USD' }, qty: '10' }],
+      offers: [{ px: { value: '0.41', currency: 'USD' }, qty: '8' }],
+      state: 'open',
+      transactTime: '1700000000', // seconds
+    },
+  });
+  transport.pushMessage(frame);
+  assert.equal(sink.records.length, 1);
+  const rec = sink.records[0]!;
+  assert.equal(rec.venue, 'POLYMARKET_US');
+  assert.equal(rec.channel, 'SUBSCRIPTION_TYPE_MARKET_DATA');
+  assert.equal(rec.market_slug, 'btc-1700');
+  assert.equal(rec.receive_timestamp, 1_700_000_005_000); // from the clock
+  assert.equal(rec.exchange_timestamp, 1_700_000_000_000); // seconds -> ms
+  assert.equal(rec.timestamp_anomaly, false);
+  assert.equal(rec.raw, frame); // verbatim
+
+  // Malformed JSON is still archived verbatim with a timestamp anomaly.
+  transport.pushMessage('{not json');
+  const bad = sink.records[1]!;
+  assert.equal(bad.channel, 'malformed');
+  assert.equal(bad.exchange_timestamp, null);
+  assert.equal(bad.timestamp_anomaly, true);
+  assert.equal(bad.raw, '{not json');
+});
+
 test('backoffDelay grows exponentially and clamps', () => {
   assert.equal(backoffDelay(0), 500);
   assert.equal(backoffDelay(1), 1000);

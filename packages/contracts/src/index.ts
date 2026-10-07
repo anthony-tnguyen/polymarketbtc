@@ -13,6 +13,7 @@ export * from './reference.js';
 export * from './btc.js';
 export * from './book.js';
 export * from './state.js';
+export * from './recording.js';
 export * from './repricing.js';
 export * from './features.js';
 export * from './model.js';
