@@ -12,15 +12,19 @@ the system so a reviewer can check it.
 
 ## I1 — Never trade a market whose resolution rules have not been validated
 
-**Why.** Polymarket contracts differ in strike definition, settlement source,
-rounding, and timing. Trading one we have misparsed means our entire probability
-model is pointed at the wrong event.
+**Why.** Polymarket US contracts differ in reference/settlement source, window,
+rounding, and timing, and the product family differs by type (reference Up/Down
+vs. a true fixed strike vs. touch). Trading one we have misparsed — or whose type
+we do not support — means our entire probability model is pointed at the wrong
+event.
 
-**Enforcement.** `market-data` rules parser produces a validated
-`MarketDefinition` with `rules_validated: true` only when parsing fully
-succeeds and matches the expected template. The `market_valid` entry gate fails
-closed otherwise. Snapshots of unvalidated markets may be recorded but never
-traded.
+**Enforcement.** The `market-data` rules validator produces a validated
+`MarketDefinition` with `rules_validated: true` only when parsing fully succeeds,
+the `market_type` is one we **support** (currently only
+`BTC_UP_DOWN_REFERENCE`), and the reference/settlement source is recognized
+(e.g. `CF_BRTI`). It **fails closed** on the reserved `FIXED_STRIKE`/`TOUCH`
+types and on any unknown source. The `market_valid` entry gate fails closed
+otherwise. Snapshots of unvalidated markets may be recorded but never traded.
 
 ---
 
@@ -77,8 +81,13 @@ and no orders are placed.
 **Why.** We trade against the book; a stale book means we are quoting into a
 ghost.
 
-**Enforcement.** `MAX_POLYMARKET_AGE`; same fail-closed path as I5. Sequence/gap
-detection marks the book unhealthy on a detected gap until resynced.
+**Enforcement.** `MAX_POLYMARKET_AGE`; same fail-closed path as I5. The
+Polymarket US Markets WebSocket sends a **full book snapshot per message with no
+sequence number**, so integrity is NOT sequence/gap detection on that path — it
+is staleness + disconnect + the snapshot-feed anomaly set (malformed frame,
+empty/invalid book, timestamp anomaly, impossible prices, reconnect storm; see
+I14). Any of those marks the book unhealthy until a clean frame arrives.
+Sequence/gap checks belong to a future FIX market-data adapter, not the WS.
 
 ---
 
@@ -169,9 +178,27 @@ resumes entries once reconciled.
 trading.
 
 **Enforcement.** Feed-health monitor degrades `FeedHealth`; any degraded feed
-(age, gap, reconnect storm via `MAX_RECONNECT_RATE`, clock drift via
-`MAX_CLOCK_DRIFT`) flips `feed_healthy` false and halts new orders. Open
+(age, reconnect storm via `MAX_RECONNECT_RATE`, clock drift via
+`MAX_CLOCK_DRIFT`, Binance sequence gap, or — on the Polymarket US WS — a
+snapshot-feed anomaly: malformed frame, empty/invalid book, timestamp anomaly,
+impossible prices) flips `feed_healthy` false and halts new orders. Open
 positions are managed under a defined degraded-mode exit policy, not abandoned.
+
+---
+
+## I15 — Binance is a predictive feed only; it is never settlement truth
+
+**Why.** The US hourly product resolves from CF Benchmarks **BRTI**, not Binance.
+Binance is a fast, liquid microstructure/alpha driver — ideal for *predicting*
+intrahour repricing — but it is a different price on a different venue. Treating
+it as settlement truth would systematically mis-reason about resolution, the
+opening reference, and distance-to-outcome.
+
+**Enforcement.** The reference/settlement data model (`ReferencePriceState`,
+`ReferenceSource = CF_BRTI`) is a distinct feed from `BTCState`. `FeedSource`
+separates `binance` from `brti`. The `basis_usd`/`basis_bps` fields make the
+Binance−BRTI gap an explicit, modeled quantity rather than an assumed zero. No
+code path may use a Binance price where a settlement/reference price is required.
 
 ---
 

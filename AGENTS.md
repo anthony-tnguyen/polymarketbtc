@@ -10,16 +10,27 @@ you stop and escalate rather than "work around" them.
 
 ## 1. What this system is
 
-A production trading bot for **Polymarket BTC hourly target-price contracts**.
+A production trading bot for **Polymarket US BTC hourly Up/Down contracts**.
 
-The edge is **intrahour probability repricing**, not final-settlement
-prediction. We buy the target-facing contract while it is still cheap and BTC
-is statistically capable of moving toward the strike, then exit when probability
-repricing creates a favorable *executable* bid.
+Venue is **Polymarket US** (polymarket.us), the CFTC-regulated DCM/DCO — NOT the
+international on-chain CLOB (polymarket.com). The two are separate stacks with
+different endpoints, token structures, fees, order-book and WebSocket semantics;
+international assumptions must never leak into this project (config rejects
+international endpoints; see `@pmbtc/contracts` `VenueConfig`).
 
-We optimize **realized net EV per dollar at risk**, not win rate. See
-`docs/MATH_SPEC.md` for the formal objective and `docs/ARCHITECTURE.md` for how
-the pieces fit together.
+The product resolves by comparing the official settlement reference (**CF
+Benchmarks BRTI**) against the opening reference — it does **not** ask whether
+BTC "reaches a strike within the hour" (there is no fixed strike). The edge is
+**intrahour probability repricing**, not final-settlement prediction. We buy the
+direction-facing contract while it is still cheap and BTC is statistically
+capable of moving that way, then exit when probability repricing creates a
+favorable *executable* bid. Binance is our fast **predictive** driver only; it is
+never settlement truth (Invariant I15).
+
+We optimize **realized net EV per dollar at risk**, not win rate. "First
+passage" refers to the **Polymarket contract's executable bid** reaching a
+profitable level — not BTC reaching any price. See `docs/MATH_SPEC.md` for the
+formal objective and `docs/ARCHITECTURE.md` for how the pieces fit together.
 
 ---
 

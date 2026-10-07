@@ -1,10 +1,16 @@
 # polymarket-btc-bot
 
-Production trading bot for **Polymarket BTC hourly target-price contracts**. The
-edge is **intrahour probability repricing** — buy the target-facing side while
-it is cheap and BTC is still statistically capable of reaching the strike, then
-exit into a repriced *executable* bid. We optimize **realized net EV per dollar
-at risk**, not win rate.
+Production trading bot for **Polymarket US BTC hourly Up/Down contracts**. Venue
+is **Polymarket US** (polymarket.us, CFTC-regulated) — not the international CLOB
+(polymarket.com). Each hour resolves by comparing the official reference
+(**CF Benchmarks BRTI**) against the opening reference; there is no fixed strike.
+
+The edge is **intrahour probability repricing** — buy the direction-facing side
+while it is cheap and BTC is still statistically capable of moving that way, then
+exit into a repriced *executable* bid. "First passage" is the Polymarket
+contract's executable bid reaching a profitable level, not BTC touching a price.
+Binance is a fast **predictive** driver only; BRTI is settlement truth. We
+optimize **realized net EV per dollar at risk**, not win rate.
 
 ## Start here
 

@@ -34,6 +34,12 @@ for profit targets `q ∈ {0.5%, 1.0%, ...}` (ticks per dollar at risk) and
 horizons `h ∈ {60s, 180s, ...}`. These populate the `p_tp_*` fields on
 `Opportunity` (e.g. `p_tp_05_60s = P(T_{0.5%} ≤ 60s | X_t)`).
 
+**First passage is about the contract, not BTC.** `T_q` is the first time the
+*Polymarket executable bid* reaches a profitable level — it is **not** the time
+BTC reaches any price or "touches a strike". BTC movement (via Binance) and the
+BRTI reference are *predictors* of that contract repricing; they are not the
+barrier itself.
+
 ### Competing risks
 
 We also model the race between taking profit and hitting a stop:
@@ -97,20 +103,27 @@ no wall-clock, no RNG). Replay reproduces them exactly. `feature_version` tags
 the implementation; a model is only `model_supported` if its `feature_version`
 matches.
 
-- **`distance_sigma`** — signed distance of BTC from strike in units of expected
-  move over the remaining time: `(strike − btc_price) / (σ · √(seconds_remaining))`.
+- **`distance_sigma`** — signed distance of BTC from the **opening reference**
+  (BRTI) in units of expected move over the remaining time:
+  `(opening_reference − btc_price) / (σ · √(seconds_remaining))`. There is no
+  fixed strike for the US Up/Down product; the comparison is reference-based.
+- **`basis_usd`, `basis_bps`** — signed basis between the Binance driver and the
+  BRTI reference (`binance − brti`). Underlying flow is never conflated with
+  prediction-market flow.
 - **`ewma_volatility`**, **`volatility_ratio`** — EWMA of returns; ratio of
   short- to long-window vol (regime proxy).
-- **`target_velocity_{5,15,30,60}s`** — rate of change of BTC toward the strike
-  over each lookback.
+- **`target_velocity_{5,15,30,60}s`** — rate of change of BTC toward the opening
+  reference over each lookback.
 - **`target_acceleration`** — change in `target_velocity`.
-- **`ofi_{5,15,30,60}s`** — order-flow imbalance of the Polymarket book over each
-  window.
-- **`obi_l1`, `obi_l5`, `obi_l10`** — order-book imbalance at 1/5/10 levels.
-- **`microalpha`** — short-horizon fair-value drift estimate from microstructure.
-- **`spread`, `depth`, `quote_velocity`, `ladder_residual`** — book-shape
-  features (`ladder_residual` = deviation of the observed ladder from its fitted
-  shape).
+- **`btc_ofi_{5,15,30,60}s`** / **`poly_ofi_{5,15,30,60}s`** — order-flow
+  imbalance of the Binance book and the Polymarket US book respectively, over
+  each window (kept separate; they are different processes).
+- **`btc_obi`** / **`poly_obi_l1`, `poly_obi_l5`, `poly_obi_l10`** — Binance
+  order-book imbalance, and Polymarket order-book imbalance at 1/5/10 levels.
+- **`btc_microalpha`** — short-horizon fair-value drift estimate from BTC
+  microstructure. **`poly_quote_velocity`** — Polymarket requote rate.
+- **`spread`, `depth`, `ladder_residual`** — Polymarket book-shape features
+  (`ladder_residual` = deviation of the observed ladder from its fitted shape).
 
 `volatility_regime` (a discrete label) is derived from `volatility_ratio` and
 drives `supported_regime` gating.
