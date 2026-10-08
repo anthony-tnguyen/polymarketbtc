@@ -62,28 +62,51 @@ Market data comes from the **Markets WebSocket**
 - Integrity reduces to **staleness + disconnect** detection (feed-health layer),
   since every message is a fresh full book.
 
-**ASSUMPTION US-TS (timestamp).** `transactTime` is a string; a purely-numeric
-value is treated as epoch milliseconds, otherwise as ISO-8601
-(`parseTransactTime`). When absent, the local receive time is used as the
-exchange-time fallback (the two timestamps stay distinct). **Confirm the real
-unit against a live frame before trusting recorded times.**
+**ASSUMPTION US-TS (timestamp).** `transactTime` is parsed **magnitude-aware**
+(`parseVenueTimestamp` / `parseNumericTimestamp` in `timestamp.ts`): a numeric
+value is classified as seconds (~1e9) / milliseconds (~1e12) / microseconds
+(~1e15) / nanoseconds (~1e18) by magnitude, and ambiguous or implausible values
+are **rejected** rather than assumed to be milliseconds. A non-numeric value is
+parsed as ISO-8601. When absent/ambiguous/implausible, the local receive time is
+used as the exchange-time fallback and a `timestamp_anomaly` is flagged (the two
+timestamps stay distinct). **The real unit is still UNCONFIRMED — a live frame
+will pin it down; the magnitude-aware parser is correct for whichever unit the
+venue emits within the plausible window.**
 
 **ASSUMPTION US-PX (price units).** `px.value` is parsed as dollars in `[0, 1]`
-(e.g. "0.37" = 37¢). If the DCM quotes in cents (0–100) instead, divide by 100.
-**Confirm against a live frame.**
+(e.g. "0.37" = 37¢); a price outside `[0,1]` (or a crossed book) is flagged
+`impossible_prices` by the book core. If the DCM quotes in cents (0–100) instead,
+divide by 100. **UNCONFIRMED — confirm against a live frame.**
 
-### Open questions (need docs.polymarket.us access — egress-blocked here — or a
-live capture):
+### Contract identity (schema resolved; live representation UNCONFIRMED)
 
-1. **Binary market identity.** The WS identifies a contract by `marketSlug` and
-   exposes one `bids`/`offers` book. How are YES vs NO represented — two slugs,
-   or one book priced for YES with NO as the complement? This decides whether
-   `MarketDefinition.token_ids {YES, NO}` is the right contract shape or should
-   become slug-based. Deferred deliberately; the book core takes identity as a
-   parameter so it is unaffected either way.
+The venue-neutral identity on the recorder path is now **`market_slug` +
+`outcome_id` + `direction` (UP/DOWN)**, not `token_ids {YES, NO}` (that scheme is
+retained only for a possible future international/FIXED_STRIKE adapter). This is
+the right shape for a reference Up/Down product. What a **live capture must still
+confirm**: whether the two directions are two separate slugs or one book with the
+complement implied, and the exact field that carries `marketSlug`/direction.
+
+### Open questions — UNRESOLVED (egress to polymarket.us is blocked in this
+environment; a live capture or docs.polymarket.us access is required):
+
+1. **UP/DOWN vs YES/NO representation** and whether one slug is one directional
+   book or outcomes are encoded another way.
 2. **transactTime unit** (US-TS) and **price units** (US-PX) above.
-3. Whether `MarketData` is truly snapshot-only or whether a separate incremental
-   update type exists that the SDK does not surface.
+3. Whether every `MarketData` message is a complete snapshot, or a separate
+   incremental update type exists that the SDK does not surface.
+4. The exact subscribe-frame envelope (`buildPolymarketUsSubscribeFrames` mirrors
+   the SDK shape but is unconfirmed).
+5. Fields that identify market state, close time, reference value, and
+   settlement; minimum order size / tick behavior; any message variants not
+   represented by the current schemas.
+
+A transport-injected **capture utility** (`live/capture.ts`,
+`PolymarketUsCapture`) and a real WebSocket adapter (`live/ws-transport.ts`) are
+implemented and unit-tested against a mock transport; they persist every raw
+frame verbatim with both timestamps (`RawEventRecord`) so these questions can be
+answered the moment the feed is reachable. **Nothing here is marked confirmed
+until a real capture validates it.**
 
 ### Historical note — international hash investigation
 

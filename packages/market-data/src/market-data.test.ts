@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import type { MarketId, TokenId } from '@pmbtc/contracts';
+import type { MarketId, MarketSlug, OutcomeId } from '@pmbtc/contracts';
 import {
   Ladder,
   BinanceDepthBook,
@@ -8,16 +8,24 @@ import {
   PolymarketUsBook,
   MarketDataMessage,
   parseTransactTime,
+  parseNumericTimestamp,
+  parseVenueTimestamp,
   evaluateFeedHealth,
   assembleUnifiedState,
+  computeBasis,
   backoffDelay,
   DEFAULT_RECONNECT,
   estimateOffset,
   ClockSynchronizer,
   validateMarketDefinition,
   markValidated,
+  MockTransportFactory,
+  PolymarketUsCapture,
+  InMemoryRawEventSink,
+  buildPolymarketUsSubscribeFrames,
 } from '@pmbtc/market-data';
-import type { MarketDefinition } from '@pmbtc/contracts';
+import { ManualClock } from '@pmbtc/core';
+import type { MarketDefinition, ReferencePriceState } from '@pmbtc/contracts';
 
 // ── Ladder ────────────────────────────────────────────────────────────────
 test('Ladder sorts deterministically regardless of insertion order', () => {
@@ -80,7 +88,9 @@ test('BinanceDepthBook flags a gap on a non-contiguous update and clears book', 
 
 // ── Polymarket US book: full-snapshot-per-message ───────────────────────────
 const MKT = 'btc-1700' as MarketId;
-const TOK = 'tok-yes' as TokenId;
+const SLUG = 'btc-up-or-down-1700' as MarketSlug;
+const OUT = 'btc-1700-up' as OutcomeId;
+const bookInit = { market_id: MKT, market_slug: SLUG, outcome_id: OUT, direction: 'UP' as const };
 
 function marketData(
   bids: [string, string][],
@@ -101,20 +111,28 @@ function marketData(
 }
 
 test('PolymarketUsBook has no data until a MarketData frame arrives', () => {
-  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+  const s = new PolymarketUsBook(bookInit);
   assert.equal(s.hasData, false);
 });
 
 test('PolymarketUsBook replaces the whole book on each snapshot', () => {
-  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+  const s = new PolymarketUsBook(bookInit);
   s.apply(marketData([['0.39', '10']], [['0.41', '8']], { transactTime: '1700000000000' }), 1_700_000_000_050);
   let book = s.toBook(1_700_000_000_060);
   assert.equal(book.bids[0]!.price, 0.39);
   assert.equal(book.asks[0]!.price, 0.41); // `offers` map to asks
+  assert.equal(book.market_slug, SLUG);
+  assert.equal(book.outcome_id, OUT);
+  assert.equal(book.direction, 'UP');
   assert.equal(book.timestamps.exchange_timestamp, 1_700_000_000_000);
   assert.equal(book.sequence, null);
   assert.equal(book.book_hash, null);
   assert.equal(book.gap_detected, false);
+  assert.deepEqual(s.anomalies, {
+    timestamp_anomaly: false,
+    empty_or_invalid_book: false,
+    impossible_prices: false,
+  });
 
   // A new snapshot fully replaces prior state (not merged).
   s.apply(marketData([['0.42', '3']], [['0.44', '2']], { state: 'open', transactTime: '1700000001000' }), 1_700_000_001_050);
@@ -124,10 +142,22 @@ test('PolymarketUsBook replaces the whole book on each snapshot', () => {
   assert.equal(s.state, 'open');
 });
 
-test('PolymarketUsBook falls back to receive time when transactTime is absent', () => {
-  const s = new PolymarketUsBook({ market_id: MKT, token_id: TOK, side: 'YES' });
+test('PolymarketUsBook falls back to receive time and flags a timestamp anomaly when transactTime is absent', () => {
+  const s = new PolymarketUsBook(bookInit);
   s.apply(marketData([['0.5', '1']], [['0.51', '1']]), 1_700_000_002_000);
   assert.equal(s.toBook(1_700_000_002_010).timestamps.exchange_timestamp, 1_700_000_002_000);
+  assert.equal(s.anomalies.timestamp_anomaly, true);
+});
+
+test('PolymarketUsBook flags empty and crossed/impossible books', () => {
+  const empty = new PolymarketUsBook(bookInit);
+  empty.apply(marketData([['0.5', '1']], [], { transactTime: '1700000000000' }), 1_700_000_000_050);
+  assert.equal(empty.anomalies.empty_or_invalid_book, true);
+
+  const crossed = new PolymarketUsBook(bookInit);
+  // best bid 0.6 >= best ask 0.55 -> crossed book.
+  crossed.apply(marketData([['0.6', '1']], [['0.55', '1']], { transactTime: '1700000000000' }), 1_700_000_000_050);
+  assert.equal(crossed.anomalies.impossible_prices, true);
 });
 
 test('parseTransactTime handles epoch-ms strings, ISO, and junk', () => {
@@ -136,6 +166,41 @@ test('parseTransactTime handles epoch-ms strings, ISO, and junk', () => {
   assert.equal(parseTransactTime('', 42), 42);
   assert.equal(parseTransactTime(undefined, 42), 42);
   assert.equal(parseTransactTime('not-a-date', 42), 42);
+});
+
+// ── Magnitude-aware timestamp parsing ───────────────────────────────────────
+test('parseNumericTimestamp infers unit from magnitude', () => {
+  const sec = parseNumericTimestamp(1_700_000_000); // seconds
+  assert.ok(sec.ok && sec.value.unit === 'seconds' && sec.value.ms === 1_700_000_000_000);
+  const ms = parseNumericTimestamp(1_700_000_000_000); // milliseconds
+  assert.ok(ms.ok && ms.value.unit === 'milliseconds' && ms.value.ms === 1_700_000_000_000);
+  const us = parseNumericTimestamp(1_700_000_000_000_000); // microseconds
+  assert.ok(us.ok && us.value.unit === 'microseconds' && us.value.ms === 1_700_000_000_000);
+  const ns = parseNumericTimestamp(1_700_000_000_000_000_000); // nanoseconds
+  assert.ok(ns.ok && ns.value.unit === 'nanoseconds' && ns.value.ms === 1_700_000_000_000);
+});
+
+test('parseNumericTimestamp rejects implausible and invalid values', () => {
+  assert.equal(parseNumericTimestamp(12345).ok, false); // too small for any unit
+  assert.equal(parseNumericTimestamp(-1).ok, false);
+  assert.equal(parseNumericTimestamp(0).ok, false);
+  assert.equal(parseNumericTimestamp(Number.NaN).ok, false);
+  assert.equal(parseNumericTimestamp(Number.POSITIVE_INFINITY).ok, false);
+  const bad = parseNumericTimestamp(12345);
+  assert.ok(!bad.ok && bad.error.code === 'implausible');
+});
+
+test('parseVenueTimestamp handles numeric strings, numbers, and ISO', () => {
+  const s = parseVenueTimestamp('1700000000'); // seconds string -> ms
+  assert.ok(s.ok && s.value.ms === 1_700_000_000_000);
+  const n = parseVenueTimestamp(1_700_000_000_000);
+  assert.ok(n.ok && n.value.ms === 1_700_000_000_000);
+  const iso = parseVenueTimestamp('2023-11-14T22:13:20.000Z');
+  assert.ok(iso.ok && iso.value.ms === Date.parse('2023-11-14T22:13:20.000Z'));
+  assert.equal(parseVenueTimestamp('').ok, false);
+  assert.equal(parseVenueTimestamp(null).ok, false);
+  assert.equal(parseVenueTimestamp('not-a-date').ok, false);
+  assert.equal(parseVenueTimestamp('1999-01-01T00:00:00Z').ok, false); // outside plausible window
 });
 
 // ── Feed health ─────────────────────────────────────────────────────────────
@@ -167,6 +232,31 @@ test('evaluateFeedHealth classifies down / degraded / healthy', () => {
   assert.equal(ok.age_ms, 500);
 });
 
+test('evaluateFeedHealth degrades the Polymarket US feed on snapshot-feed anomalies (not sequence gaps)', () => {
+  const base = {
+    source: 'polymarket' as const,
+    now: 10_000,
+    lastExchangeTs: 9500, // fresh
+    gapDetected: false, // US WS has no sequence gap
+    reconnectCount: 0,
+    clockDriftMs: 0,
+    maxAgeMs: 2000,
+    maxReconnectRate: 5,
+    maxClockDriftMs: 250,
+  };
+  const healthy = evaluateFeedHealth({ ...base, venueState: 'open' });
+  assert.equal(healthy.status, 'healthy');
+  assert.equal(healthy.venue_state, 'open');
+
+  const impossible = evaluateFeedHealth({ ...base, anomalies: { impossible_prices: true } });
+  assert.equal(impossible.status, 'degraded');
+  assert.match(impossible.detail ?? '', /impossible prices/);
+
+  const malformed = evaluateFeedHealth({ ...base, anomalies: { malformed_frame: true } });
+  assert.equal(malformed.status, 'degraded');
+  assert.match(malformed.detail ?? '', /malformed/);
+});
+
 // ── Unified state ───────────────────────────────────────────────────────────
 test('assembleUnifiedState computes freshness and tradeable', () => {
   const now = 1_700_000_010_000;
@@ -181,18 +271,29 @@ test('assembleUnifiedState computes freshness and tradeable', () => {
   };
   const book = {
     market_id: MKT,
-    token_id: TOK,
-    side: 'YES' as const,
+    market_slug: SLUG,
+    outcome_id: OUT,
+    direction: 'UP' as const,
     timestamps: { exchange_timestamp: now - 400, receive_timestamp: now - 390 },
     bids: [{ price: 0.4, size: 10 }],
     asks: [{ price: 0.41, size: 8 }],
     sequence: null,
-    book_hash: '0x1',
+    book_hash: null,
     gap_detected: false,
+  };
+  const reference: ReferencePriceState = {
+    source: 'CF_BRTI',
+    reference_price: 65010,
+    reference_timestamp: now - 200,
+    window_start: now - 60_000,
+    window_end: now,
+    receive_timestamp: now - 190,
+    freshness_ms: 200,
   };
   const u = assembleUnifiedState({
     btc,
     book,
+    reference,
     now,
     closeTime: now + 600_000,
     maxBinanceAgeMs: 1500,
@@ -200,8 +301,22 @@ test('assembleUnifiedState computes freshness and tradeable', () => {
   });
   assert.equal(u.btc_age_ms, 300);
   assert.equal(u.book_age_ms, 400);
+  assert.equal(u.reference_age_ms, 200);
+  assert.equal(u.direction, 'UP');
   assert.equal(u.seconds_remaining, 600);
   assert.equal(u.tradeable, true);
+  // basis = binance(65000) − brti(65010) = −10 usd.
+  assert.ok(u.basis);
+  assert.equal(u.basis!.basis_usd, -10);
+  assert.ok(Math.abs(u.basis!.basis_bps - (-10 / 65010) * 10_000) < 1e-9);
+
+  // Without a reference feed, basis and reference age are null (Binance alone is not settlement truth).
+  const noRef = assembleUnifiedState({
+    btc, book, now, closeTime: now + 600_000, maxBinanceAgeMs: 1500, maxPolymarketAgeMs: 2000,
+  });
+  assert.equal(noRef.reference, null);
+  assert.equal(noRef.basis, null);
+  assert.equal(noRef.reference_age_ms, null);
 
   // A gapped book is not tradeable.
   const u2 = assembleUnifiedState({
@@ -215,7 +330,81 @@ test('assembleUnifiedState computes freshness and tradeable', () => {
   assert.equal(u2.tradeable, false);
 });
 
+test('computeBasis is signed binance − brti in usd and bps', () => {
+  const ref: ReferencePriceState = {
+    source: 'CF_BRTI',
+    reference_price: 100,
+    reference_timestamp: 1,
+    window_start: 0,
+    window_end: 2,
+    receive_timestamp: 1,
+    freshness_ms: 0,
+  };
+  const b = computeBasis(101, ref, { exchange_timestamp: 1, receive_timestamp: 1 });
+  assert.equal(b.basis_usd, 1);
+  assert.equal(b.basis_bps, 100); // 1/100 * 10000
+});
+
 // ── Backoff ───────────────────────────────────────────────────────────────
+// ── Live capture (transport/clock-injected, deterministic) ──────────────────
+test('PolymarketUsCapture subscribes on open to all three channels', () => {
+  const frames = buildPolymarketUsSubscribeFrames({ marketSlugs: ['btc-1700'], nextRequestId: () => 'r' });
+  assert.equal(frames.length, 3);
+  const types = frames.map((f) => JSON.parse(f).subscriptionType);
+  assert.deepEqual(types, [
+    'SUBSCRIPTION_TYPE_MARKET_DATA',
+    'SUBSCRIPTION_TYPE_MARKET_DATA_LITE',
+    'SUBSCRIPTION_TYPE_TRADE',
+  ]);
+});
+
+test('PolymarketUsCapture archives raw frames verbatim with both timestamps', () => {
+  const factory = new MockTransportFactory();
+  const sink = new InMemoryRawEventSink();
+  const clock = new ManualClock(1_700_000_005_000);
+  const capture = new PolymarketUsCapture({
+    factory,
+    sink,
+    clock,
+    url: 'wss://api.polymarket.us/v1/ws/markets',
+    options: { marketSlugs: ['btc-1700'], nextRequestId: () => 'r' },
+  });
+  capture.start();
+  const transport = factory.created[0]!;
+  transport.pushOpen();
+  assert.equal(transport.sent.length, 3); // subscribed on open
+
+  const frame = JSON.stringify({
+    requestId: 'x',
+    subscriptionType: 'SUBSCRIPTION_TYPE_MARKET_DATA',
+    marketData: {
+      marketSlug: 'btc-1700',
+      bids: [{ px: { value: '0.4', currency: 'USD' }, qty: '10' }],
+      offers: [{ px: { value: '0.41', currency: 'USD' }, qty: '8' }],
+      state: 'open',
+      transactTime: '1700000000', // seconds
+    },
+  });
+  transport.pushMessage(frame);
+  assert.equal(sink.records.length, 1);
+  const rec = sink.records[0]!;
+  assert.equal(rec.venue, 'POLYMARKET_US');
+  assert.equal(rec.channel, 'SUBSCRIPTION_TYPE_MARKET_DATA');
+  assert.equal(rec.market_slug, 'btc-1700');
+  assert.equal(rec.receive_timestamp, 1_700_000_005_000); // from the clock
+  assert.equal(rec.exchange_timestamp, 1_700_000_000_000); // seconds -> ms
+  assert.equal(rec.timestamp_anomaly, false);
+  assert.equal(rec.raw, frame); // verbatim
+
+  // Malformed JSON is still archived verbatim with a timestamp anomaly.
+  transport.pushMessage('{not json');
+  const bad = sink.records[1]!;
+  assert.equal(bad.channel, 'malformed');
+  assert.equal(bad.exchange_timestamp, null);
+  assert.equal(bad.timestamp_anomaly, true);
+  assert.equal(bad.raw, '{not json');
+});
+
 test('backoffDelay grows exponentially and clamps', () => {
   assert.equal(backoffDelay(0), 500);
   assert.equal(backoffDelay(1), 1000);
@@ -256,29 +445,36 @@ test('ClockSynchronizer evicts beyond the window', () => {
 });
 
 // ── Rules validation (I1) ────────────────────────────────────────────────────
-function validDef(overrides: Partial<MarketDefinition> = {}): MarketDefinition {
+function validDef(overrides: Record<string, unknown> = {}): MarketDefinition {
   return {
+    market_type: 'BTC_UP_DOWN_REFERENCE',
     market_id: 'btc-1700' as MarketId,
-    question: 'Will BTC be >= 65000 at 12:00 UTC?',
+    market_slug: 'btc-up-or-down-1700' as MarketSlug,
+    question: 'Will BTC be up or down at 12:00 UTC?',
     underlying: 'BTCUSDT',
-    strike: 65000,
-    comparator: 'above',
     open_time: 1_700_000_000_000,
     close_time: 1_700_003_600_000,
-    settlement_source: 'polymarket-us-settlement',
-    token_ids: { YES: 'tok-yes' as TokenId, NO: 'tok-no' as TokenId },
+    reference_source: 'CF_BRTI',
+    settlement_source: 'CF_BRTI',
+    opening_reference_price: 65000,
+    reference_window: { start: 1_700_000_000_000, end: 1_700_000_060_000 },
+    settlement_window: { start: 1_700_003_540_000, end: 1_700_003_600_000 },
+    outcomes: [
+      { outcome_id: 'btc-1700-up' as OutcomeId, direction: 'UP' },
+      { outcome_id: 'btc-1700-down' as OutcomeId, direction: 'DOWN' },
+    ],
     tick_size: 0.01,
     min_order_size: 5,
     rules_validated: false,
     rules_parser_version: 'v001',
     discovered_at: 1_699_999_000_000,
     ...overrides,
-  };
+  } as MarketDefinition;
 }
 
-const ALLOW = ['polymarket-us-settlement'];
+const ALLOW = ['CF_BRTI'];
 
-test('validateMarketDefinition passes a well-formed market with a known source', () => {
+test('validateMarketDefinition passes a well-formed Up/Down market with a known source', () => {
   const r = validateMarketDefinition(validDef(), { allowedSettlementSources: ALLOW });
   assert.deepEqual(r, { valid: true, notes: [] });
 });
@@ -297,6 +493,30 @@ test('validateMarketDefinition rejects an unknown settlement source', () => {
   assert.match(r.notes.join(' '), /not in the recognized allowlist/);
 });
 
+test('validateMarketDefinition fails closed on an unsupported market type (FIXED_STRIKE/TOUCH)', () => {
+  const touch = {
+    market_type: 'TOUCH' as const,
+    market_id: 'm' as MarketId,
+    market_slug: 's' as MarketSlug,
+    question: 'q',
+    underlying: 'BTCUSDT',
+    open_time: 1_700_000_000_000,
+    close_time: 1_700_003_600_000,
+    strike: 65000,
+    comparator: 'touch_above' as const,
+    settlement_source: 'CF_BRTI',
+    token_ids: { YES: 'y', NO: 'n' },
+    tick_size: 0.01,
+    min_order_size: 5,
+    rules_validated: false,
+    rules_parser_version: 'v001' as const,
+    discovered_at: 1,
+  } as unknown as MarketDefinition;
+  const r = validateMarketDefinition(touch, { allowedSettlementSources: ALLOW });
+  assert.equal(r.valid, false);
+  assert.match(r.notes.join(' '), /not supported in the current scope/);
+});
+
 test('validateMarketDefinition rejects bad window and tick', () => {
   const r = validateMarketDefinition(
     validDef({ close_time: 1_700_000_000_000, tick_size: 1 }),
@@ -312,7 +532,7 @@ test('markValidated stamps rules_validated and notes', () => {
   assert.equal(good.rules_validated, true);
   assert.equal(good.validation_notes, undefined);
 
-  const bad = markValidated(validDef({ strike: -1 }), { allowedSettlementSources: ALLOW });
+  const bad = markValidated(validDef({ min_order_size: -1 }), { allowedSettlementSources: ALLOW });
   assert.equal(bad.rules_validated, false);
-  assert.match(bad.validation_notes ?? '', /strike/);
+  assert.match(bad.validation_notes ?? '', /min_order_size/);
 });

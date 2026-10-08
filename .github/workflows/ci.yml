@@ -1,0 +1,99 @@
+name: CI
+
+# Base CI for the recorder-foundation phase. Prevents regressions in contracts,
+# market-data, timestamp parsing, rules validation, and venue config. Replay
+# tests are intentionally NOT required yet (the replay engine does not exist);
+# add a replay job when packages/replay lands.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (all workspaces)
+        run: npm run build
+
+      - name: Typecheck (all workspaces)
+        run: npm run typecheck
+
+      - name: Unit tests (all workspaces)
+        run: npm test
+
+      - name: Integration tests
+        run: |
+          if ls tests/integration/*.test.* >/dev/null 2>&1; then
+            node --test --experimental-strip-types "tests/integration/**/*.test.ts"
+          else
+            echo "no integration tests yet — skipping"
+          fi
+
+      - name: Adversarial tests
+        run: |
+          if ls tests/adversarial/*.test.* >/dev/null 2>&1; then
+            node --test --experimental-strip-types "tests/adversarial/**/*.test.ts"
+          else
+            echo "no adversarial tests yet — skipping"
+          fi
+
+  config-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Reject international Polymarket endpoints in tracked config
+        shell: bash
+        run: |
+          # Fail closed if any international Polymarket endpoint leaks into
+          # config. The venue is POLYMARKET_US only. The venue guard
+          # (venue.ts) and its tests legitimately NAME these hosts in order to
+          # reject them, and ASSUMPTIONS.md keeps a historical note, so those are
+          # excluded; everything else must be clean.
+          if grep -RInE 'clob\.polymarket\.com|ws-subscriptions-clob\.polymarket\.com|gamma-api\.polymarket\.com' \
+               --include='*.ts' --include='*.json' --include='*.env*' --include='.env.example' \
+               --exclude='venue.ts' --exclude='*.test.ts' \
+               --exclude-dir='node_modules' --exclude-dir='dist' \
+               -- . ; then
+            echo "::error::international Polymarket endpoint found in tracked config (POLYMARKET_US only)"
+            exit 1
+          fi
+          echo "no international Polymarket endpoints found"
+
+      # The contracts test imports @pmbtc/contracts, which resolves to its built
+      # dist/ (package `exports`), so the package must be built before testing.
+      - name: Build contracts
+        run: npm run build --workspace @pmbtc/contracts
+
+      - name: Venue + contract config tests
+        run: npm test --workspace @pmbtc/contracts

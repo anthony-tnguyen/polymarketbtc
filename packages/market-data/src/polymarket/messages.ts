@@ -86,15 +86,16 @@ export const PolymarketUsMessage = z.union([
 ]);
 export type PolymarketUsMessage = z.infer<typeof PolymarketUsMessage>;
 
+import { parseVenueTimestamp } from '../timestamp.js';
+
 /**
- * Parse the venue `transactTime` string to epoch millis.
- * ASSUMPTION US-TS: a purely-numeric string is epoch milliseconds; otherwise it
- * is an ISO-8601 datetime. Returns `fallback` when absent/unparseable so the
- * recorder still stamps a coherent time (receive time is always distinct).
+ * Parse the venue `transactTime` to epoch millis, magnitude-aware (seconds / ms /
+ * microseconds / nanoseconds are disambiguated by value; see ../timestamp.ts).
+ * Returns `fallback` when absent/ambiguous/implausible so the recorder still
+ * stamps a coherent time (the receive time is always distinct). Use
+ * {@link parseVenueTimestamp} directly when you need to detect the anomaly.
  */
 export function parseTransactTime(transactTime: string | null | undefined, fallback: number): number {
-  if (transactTime == null || transactTime === '') return fallback;
-  if (/^\d+$/.test(transactTime)) return Number(transactTime);
-  const parsed = Date.parse(transactTime);
-  return Number.isNaN(parsed) ? fallback : parsed;
+  const r = parseVenueTimestamp(transactTime);
+  return r.ok ? r.value.ms : fallback;
 }

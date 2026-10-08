@@ -6,29 +6,142 @@ import {
   RiskLimits,
   OrderStatus,
   FEATURE_VERSION,
+  VenueConfig,
+  parseVenueConfig,
+  isInternationalPolymarketEndpoint,
+  POLYMARKET_US_ENDPOINTS,
+  ReferencePriceState,
+  ReferenceBasis,
+  RepricingObservation,
 } from '@pmbtc/contracts';
 
 const ts = { exchange_timestamp: 1_700_000_000_000, receive_timestamp: 1_700_000_000_050 };
 
-test('MarketDefinition accepts a validated market and rejects a bad strike', () => {
-  const base = {
+function upDownMarket(overrides: Record<string, unknown> = {}) {
+  return {
+    market_type: 'BTC_UP_DOWN_REFERENCE',
     market_id: 'btc-1700000000',
-    question: 'Will BTC be >= 65000 at 12:00 UTC?',
+    market_slug: 'btc-up-or-down-1700',
+    question: 'Will BTC be up or down at 12:00 UTC?',
     underlying: 'BTCUSDT',
-    strike: 65000,
-    comparator: 'above',
     open_time: 1_700_000_000_000,
     close_time: 1_700_003_600_000,
-    settlement_source: 'binance-spot-index',
-    token_ids: { YES: 'tok-yes', NO: 'tok-no' },
+    reference_source: 'CF_BRTI',
+    settlement_source: 'CF_BRTI',
+    opening_reference_price: 65000,
+    reference_window: { start: 1_700_000_000_000, end: 1_700_000_060_000 },
+    settlement_window: { start: 1_700_003_540_000, end: 1_700_003_600_000 },
+    outcomes: [
+      { outcome_id: 'btc-1700-up', direction: 'UP' },
+      { outcome_id: 'btc-1700-down', direction: 'DOWN' },
+    ],
     tick_size: 0.01,
     min_order_size: 5,
     rules_validated: true,
     rules_parser_version: 'v001',
     discovered_at: 1_699_999_000_000,
+    ...overrides,
   };
-  assert.equal(MarketDefinition.safeParse(base).success, true);
-  assert.equal(MarketDefinition.safeParse({ ...base, strike: -1 }).success, false);
+}
+
+test('MarketDefinition accepts an Up/Down reference market and allows a null opening reference', () => {
+  assert.equal(MarketDefinition.safeParse(upDownMarket()).success, true);
+  assert.equal(MarketDefinition.safeParse(upDownMarket({ opening_reference_price: null })).success, true);
+  // An unknown discriminant is rejected by the discriminated union.
+  assert.equal(MarketDefinition.safeParse(upDownMarket({ market_type: 'MYSTERY' })).success, false);
+  // Reserved types still parse structurally (fail-closed happens at rules validation).
+  const touch = {
+    market_type: 'TOUCH',
+    market_id: 'm',
+    market_slug: 's',
+    question: 'q',
+    underlying: 'BTCUSDT',
+    open_time: 1,
+    close_time: 2,
+    strike: 65000,
+    comparator: 'touch_above',
+    settlement_source: 'some-oracle',
+    token_ids: { YES: 'y', NO: 'n' },
+    tick_size: 0.01,
+    min_order_size: 5,
+    rules_validated: false,
+    rules_parser_version: 'v001',
+    discovered_at: 1,
+  };
+  assert.equal(MarketDefinition.safeParse(touch).success, true);
+});
+
+test('VenueConfig rejects international Polymarket endpoints and accepts US', () => {
+  assert.equal(isInternationalPolymarketEndpoint('wss://ws-subscriptions-clob.polymarket.com/ws/market'), true);
+  assert.equal(isInternationalPolymarketEndpoint('https://clob.polymarket.com'), true);
+  assert.equal(isInternationalPolymarketEndpoint(POLYMARKET_US_ENDPOINTS.marketsWs), false);
+  assert.equal(isInternationalPolymarketEndpoint(POLYMARKET_US_ENDPOINTS.restBase), false);
+
+  // Defaults to the canonical US endpoints.
+  const cfg = parseVenueConfig({});
+  assert.equal(cfg.venue, 'POLYMARKET_US');
+  assert.equal(cfg.polymarketWsUrl, POLYMARKET_US_ENDPOINTS.marketsWs);
+
+  // An international endpoint fails closed.
+  assert.throws(() => parseVenueConfig({ POLYMARKET_WS_URL: 'wss://ws-subscriptions-clob.polymarket.com/ws/market' }));
+  assert.throws(() => parseVenueConfig({ POLYMARKET_REST_URL: 'https://clob.polymarket.com' }));
+  // A non-US venue literal fails closed.
+  assert.equal(VenueConfig.safeParse({
+    venue: 'POLYMARKET_INTL',
+    polymarketWsUrl: POLYMARKET_US_ENDPOINTS.marketsWs,
+    polymarketRestUrl: POLYMARKET_US_ENDPOINTS.restBase,
+    binanceWsUrl: 'wss://stream.binance.com:9443/ws',
+  }).success, false);
+});
+
+test('ReferencePriceState and ReferenceBasis enforce source and shape', () => {
+  const ref = {
+    source: 'CF_BRTI',
+    reference_price: 65010,
+    reference_timestamp: 1_700_000_000_000,
+    window_start: 1_700_000_000_000,
+    window_end: 1_700_000_060_000,
+    receive_timestamp: 1_700_000_000_040,
+    freshness_ms: 40,
+  };
+  assert.equal(ReferencePriceState.safeParse(ref).success, true);
+  // Binance is never a reference source.
+  assert.equal(ReferencePriceState.safeParse({ ...ref, source: 'binance' }).success, false);
+
+  const basis = {
+    timestamps: ts,
+    binance_price: 65000,
+    brti_price: 65010,
+    basis_usd: -10,
+    basis_bps: -1.538,
+  };
+  assert.equal(ReferenceBasis.safeParse(basis).success, true);
+});
+
+test('RepricingObservation keeps lags nullable (censoring)', () => {
+  const obs = {
+    market_id: 'btc-1700',
+    direction: 'UP',
+    observed_at: 1_700_000_000_500,
+    trigger: {
+      feed: 'binance',
+      timestamps: ts,
+      price_before: 65000,
+      price_after: 65100,
+      move_bps: 15.38,
+    },
+    config: {
+      trigger_feed: 'binance',
+      move_threshold_bps: 10,
+      move_window_ms: 1000,
+      max_response_ms: 5000,
+    },
+    btc_to_poly_ask_lag_ms: 420,
+    btc_to_poly_bid_lag_ms: null,
+    brti_to_poly_lag_ms: null,
+    censored: false,
+  };
+  assert.equal(RepricingObservation.safeParse(obs).success, true);
 });
 
 test('Opportunity round-trips a full happy-path object', () => {

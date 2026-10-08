@@ -10,15 +10,23 @@ refers to by name).
 
 ## 1. The strategy in one paragraph
 
-Polymarket lists hourly BTC contracts that resolve on whether BTC reaches a
-target (strike) within the hour. Their price is a market-implied probability
-that moves continuously as BTC moves and as the hour elapses. We do **not** try
-to predict final settlement. We buy the target-facing side while it is cheap and
-BTC is still statistically capable of reaching the strike, then **exit into a
-repriced executable bid** once probability has moved in our favor. The modeling
-question is therefore not "will it settle yes?" but "what is the probability
-that the *executable Polymarket bid* reaches a profit target `q` within horizon
-`h`, before hitting a stop?" — a **first-passage / competing-risks** problem.
+Our venue is **Polymarket US** (polymarket.us), the CFTC-regulated DCM/DCO — not
+the international on-chain CLOB (polymarket.com). It lists hourly BTC **Up/Down**
+contracts: each hour resolves by comparing the official settlement reference
+(**CF Benchmarks BRTI**) over the settlement window against the opening reference
+over the opening window — UP pays if BTC closed above the opening reference, DOWN
+otherwise. BTC does **not** have to "touch a strike"; there is no fixed strike for
+this product. The contract price is a market-implied probability that moves
+continuously as BTC moves and as the hour elapses. We do **not** try to predict
+final settlement. We buy the direction-facing side while it is cheap and BTC is
+still statistically capable of moving that way, then **exit into a repriced
+executable bid** once probability has moved in our favor. The modeling question
+is therefore not "will it settle up?" but "what is the probability that the
+*executable Polymarket bid* reaches a profit target `q` within horizon `h`,
+before hitting a stop?" — a **first-passage / competing-risks** problem, where
+*first passage refers to the Polymarket contract's executable bid reaching a
+profitable level, not BTC reaching any price*. Binance is our fast predictive
+driver; it is **never** settlement truth (see TRADING_INVARIANTS I15).
 
 ---
 
@@ -46,10 +54,11 @@ The same ordered pipeline runs in **replay** and **live**; only the sources and
 sinks differ. This is what makes backtest and production comparable.
 
 ```
- Binance WS  ──▶ BTCState ─────┐
-                               ├─▶ UnifiedMarketState ─▶ FeatureVector ─▶ ModelPrediction
- Polymarket WS ─▶ PolymarketBook ┘                                           │
- Discovery   ─▶ MarketDefinition ─▶ rules validation ─▶ (gate)               ▼
+ Binance WS  ──▶ BTCState (predictive) ─┐
+ BRTI feed   ──▶ ReferencePriceState ───┤
+                                        ├─▶ UnifiedMarketState ─▶ FeatureVector ─▶ ModelPrediction
+ Polymarket US WS ─▶ PolymarketBook ────┘   (+ Binance−BRTI basis)               │
+ Discovery   ─▶ MarketDefinition ─▶ rules validation ─▶ (gate)                   ▼
                                                                         Opportunity
                                                                              │
                                                RiskState ◀── hard gates ─────┤
@@ -72,8 +81,9 @@ be emitted at any node (reconnects, gaps, freezes, rejects) and is persisted.
 
 | Stage | Live source/sink | Replay source/sink |
 |-------|------------------|--------------------|
-| Binance | real WS | recorded events from S3/PG |
-| Polymarket | real WS | recorded book deltas |
+| Binance (predictive driver) | real WS | recorded events from S3/PG |
+| BRTI (official reference) | reference feed | recorded reference events |
+| Polymarket US | real Markets WS (full snapshot/msg) | recorded full-book snapshots |
 | Clock | NTP-disciplined monotonic | event `exchange_timestamp` |
 | Orders | CLOB API | simulated fill model (queue/depth/latency aware) |
 | Fills | exchange confirmations | synthetic `FillEvent` from book + fill model |
@@ -88,10 +98,14 @@ be emitted at any node (reconnects, gaps, freezes, rejects) and is persisted.
 - **`core`** — clock & time utilities, id/ULID generation, `Result`/error
   types, structured logging shape. The only place allowed to touch wall-clock,
   and even there the model path receives time via injection.
-- **`market-data`** — Binance WS client, Polymarket WS client, market discovery,
-  **rules parser/validator**, clock synchronization, and the **unified state
-  engine** that merges BTC + book into `UnifiedMarketState`. Also the DB
-  recorder and S3 archiver, and the feed-health monitor.
+- **`market-data`** — Binance WS client (predictive driver), Polymarket **US**
+  Markets WS client (full snapshot per message, no sequence number), the BRTI
+  reference feed, market discovery, **rules parser/validator**, magnitude-aware
+  timestamp parsing, clock synchronization, and the **unified state engine** that
+  merges BTC + BRTI + book (plus the Binance−BRTI basis) into
+  `UnifiedMarketState`. Also the raw-frame capture + S3 archiver, the Postgres
+  derived-state sink, and the feed-health monitor. Venue config
+  (`@pmbtc/contracts` `VenueConfig`) rejects international Polymarket endpoints.
 - **`features`** — deterministic feature engine producing `FeatureVector`.
   Pure; time injected; versioned (`feature_version`).
 - **`risk`** — hard limits and the freeze/reconcile logic. Independent of model
