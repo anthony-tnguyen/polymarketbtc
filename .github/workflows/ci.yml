@@ -90,5 +90,10 @@ jobs:
           fi
           echo "no international Polymarket endpoints found"
 
+      # The contracts test imports @pmbtc/contracts, which resolves to its built
+      # dist/ (package `exports`), so the package must be built before testing.
+      - name: Build contracts
+        run: npm run build --workspace @pmbtc/contracts
+
       - name: Venue + contract config tests
         run: npm test --workspace @pmbtc/contracts
